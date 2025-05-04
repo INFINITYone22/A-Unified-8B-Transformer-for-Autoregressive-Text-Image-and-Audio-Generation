@@ -1,0 +1,691 @@
+"""
+PyTorch implementation of a Unified Autoregressive Transformer
+for Text, Image (Discrete Tokens), and Audio (Discrete Tokens).
+
+Based on the architecture described in "A Unified 8B Transformer for
+Autoregressive Text, Image, and Audio Generation" (User provided PDF).
+
+Key Features:
+- Decoder-only Transformer architecture [cite: 1]
+- Handles interleaved sequences of text, image (VQ), and audio (VQ) tokens [cite: 5]
+- Uses Rotary Positional Embeddings (RoPE) [cite: 50, 52]
+- Uses FlashAttention for efficiency [cite: 49, 90]
+- Separate output heads for image and audio token prediction [cite: 8]
+- Configurable hyperparameters matching ~8B scale [cite: 13]
+"""
+
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+import math
+from dataclasses import dataclass
+import inspect # Used to print helpful warnings for FlashAttention
+
+# --- Configuration ---
+
+@dataclass
+class UnifiedTransformerConfig:
+    """Configuration class for the Unified Transformer model."""
+    # Vocabulary sizes (Placeholders - adjust based on your specific tokenizers)
+    text_vocab_size: int = 50257 # Example: GPT-2 size
+    image_vocab_size: int = 16384 # Example: VQGAN codebook size
+    audio_vocab_size: int = 1024  # Example: SoundStream VQ codebook size [cite: 34]
+
+    # Special Tokens (Optional but good practice)
+    # Define IDs for special tokens used to mark modalities or sequence boundaries
+    # These IDs should be part of the text_vocab_size or handled separately
+    # Example: <|startoftext|>, <|endoftext|>, <|startofimage|>, <|endofimage|>, <|startofaudio|>, <|endofaudio|>
+    # For simplicity, we'll rely on modality_ids input for now.
+
+    # Model Dimensions (Based on 8B target from paper [cite: 12, 13])
+    hidden_size: int = 4096       # d_model
+    num_layers: int = 36          # Number of Transformer blocks
+    num_attention_heads: int = 32 # Number of attention heads (h) [cite: 13]
+    ffn_hidden_size: int = 4 * 4096 # Inner dimension of FFN
+
+    # Sequence Length
+    max_seq_len: int = 4096       # Maximum context length
+
+    # Dropout probabilities
+    embed_dropout: float = 0.0 # Often set to 0 for large models, but can be non-zero
+    attn_dropout: float = 0.0  # Dropout in attention (FlashAttention handles internal dropout)
+    ffn_dropout: float = 0.0   # Dropout in FFN
+
+    # Normalization
+    layer_norm_eps: float = 1e-5 # Epsilon for Layer Normalization
+
+    # Implementation choices
+    use_flash_attention: bool = True # Use FlashAttention if available [cite: 49, 90]
+    use_rope: bool = True          # Use Rotary Positional Embeddings [cite: 50, 52]
+    bias: bool = False             # Use bias in Linear layers? Often False in large Transformers
+
+    # Activation function
+    activation_function: str = "gelu_new" # Or "relu", "silu", etc.
+
+    # Device (Set automatically if needed, or manually)
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    def __post_init__(self):
+        """Calculate dependent attributes."""
+        if self.ffn_hidden_size is None:
+            # Default FFN size based on PaLM paper recommendation (4x hidden_size)
+            self.ffn_hidden_size = 4 * self.hidden_size
+        # Ensure head dimension is integer
+        assert self.hidden_size % self.num_attention_heads == 0, \
+               "hidden_size must be divisible by num_attention_heads"
+        self.head_dim = self.hidden_size // self.num_attention_heads
+
+# --- FlashAttention Check and Setup ---
+try:
+    # Check for FlashAttention v2 or higher
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
+    from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
+    HAS_FLASH_ATTENTION = True
+    print("FlashAttention is available.")
+except ImportError:
+    print("FlashAttention is not installed. Consider installing it for faster training: `pip install flash-attn --no-build-isolation`")
+    print("Falling back to PyTorch's native Scaled Dot Product Attention (SDPA). Requires PyTorch 2.0+ for efficient implementation.")
+    HAS_FLASH_ATTENTION = False
+    # Check if PyTorch SDPA is available (introduced in PyTorch 2.0)
+    try:
+        # Check if the necessary function exists
+        from torch.nn.functional import scaled_dot_product_attention
+        HAS_PYTORCH_SDPA = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not HAS_PYTORCH_SDPA:
+             print("Warning: PyTorch version does not support efficient scaled_dot_product_attention. Attention performance will be suboptimal.")
+    except ImportError:
+        HAS_PYTORCH_SDPA = False
+        print("Warning: Could not check for PyTorch SDPA support. Attention performance will be suboptimal.")
+
+
+# --- Rotary Positional Embeddings (RoPE) ---
+class RotaryPositionalEmbeddings(nn.Module):
+    """
+    Implements Rotary Positional Embeddings (RoPE).
+    Reference: https://arxiv.org/abs/2104.09864
+    Adapted from various open-source implementations (e.g., LLaMA, Phil Wang).
+    """
+    def __init__(self, dim: int, max_seq_len: int, base: int = 10000, device: str = None):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+        self.device = device
+
+        # Calculate inverse frequencies (theta_i in the paper)
+        # Shape: (dim / 2)
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=device).float() / self.dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        # Precompute rotary embeddings for all positions up to max_seq_len
+        self._set_cos_sin_cache(max_seq_len, device, dtype=torch.float32) # Use float32 for precision
+
+    def _set_cos_sin_cache(self, seq_len: int, device: str, dtype: torch.dtype):
+        """Precomputes cosine and sine values for RoPE."""
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype) # Position indices
+
+        # Outer product of position indices and inverse frequencies
+        # Shape: (seq_len, dim / 2)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+
+        # Concatenate freqs with itself to match the dimension 'dim'
+        # Shape: (seq_len, dim)
+        emb = torch.cat((freqs, freqs), dim=-1)
+
+        # Compute cosine and sine caches
+        # Shape: (1, 1, seq_len, dim) - Add batch and head dimensions for broadcasting
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False)
+        print(f"RoPE cache created with shape: {self.cos_cached.shape}")
+
+
+    def forward(self, x: torch.Tensor, seq_dim: int = 1):
+        """
+        Apply RoPE to input tensor x.
+
+        Args:
+            x (torch.Tensor): Input tensor, e.g., query or key.
+                              Shape: (batch_size, seq_len, num_heads, head_dim) or (batch_size, seq_len, hidden_size)
+            seq_dim (int): The dimension corresponding to the sequence length. Default is 1.
+
+        Returns:
+            torch.Tensor: Tensor with RoPE applied.
+        """
+        seq_len = x.shape[seq_dim]
+
+        # Ensure cache is large enough and on the correct device/dtype
+        if seq_len > self.max_seq_len_cached or self.cos_cached.device != x.device or self.cos_cached.dtype != x.dtype:
+             self._set_cos_sin_cache(seq_len, device=x.device, dtype=x.dtype)
+
+        # Slice the cache to the current sequence length
+        cos = self.cos_cached[:, :, :seq_len, ...]
+        sin = self.sin_cached[:, :, :seq_len, ...]
+
+        # Reshape x for rotation: (batch_size, seq_len, num_heads, head_dim // 2, 2)
+        # This separates the pairs of dimensions to be rotated.
+        x_reshaped = x.float().reshape(*x.shape[:-1], -1, 2)
+
+        # Apply rotation using complex number multiplication logic:
+        # x_rotated = (x * cos) + (rotate_half(x) * sin)
+        # where rotate_half(x) swaps adjacent pairs and negates the second element.
+        x_out = torch.zeros_like(x)
+        x_out[..., 0::2] = x_reshaped[..., 0] * cos[..., 0::2] - x_reshaped[..., 1] * sin[..., 0::2]
+        x_out[..., 1::2] = x_reshaped[..., 1] * cos[..., 1::2] + x_reshaped[..., 0] * sin[..., 1::2]
+
+        return x_out.type_as(x)
+
+
+    @staticmethod
+    def rotate_half(x: torch.Tensor) -> torch.Tensor:
+        """Helper function to rotate half the channels for RoPE application."""
+        # Shape: (..., dim) -> (..., dim/2, 2)
+        x_reshaped = x.reshape(*x.shape[:-1], -1, 2)
+        # Swap the pairs: [x1, x2, x3, x4] -> [-x2, x1, -x4, x3]
+        x1 = x_reshaped[..., 0]
+        x2 = x_reshaped[..., 1]
+        rotated = torch.stack((-x2, x1), dim=-1)
+        # Reshape back to original dimension: (..., dim/2, 2) -> (..., dim)
+        return rotated.reshape(*x.shape)
+
+
+# --- Attention Layer (using FlashAttention or PyTorch SDPA) ---
+class CausalSelfAttention(nn.Module):
+    """
+    Multi-Head Causal Self-Attention module.
+    Uses FlashAttention if available and configured, otherwise falls back to
+    PyTorch's scaled_dot_product_attention. Includes RoPE application.
+    """
+    def __init__(self, config: UnifiedTransformerConfig):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.head_dim
+        self.use_flash = config.use_flash_attention and HAS_FLASH_ATTENTION
+        self.use_pytorch_sdpa = not self.use_flash and HAS_PYTORCH_SDPA
+        self.use_rope = config.use_rope
+
+        assert self.hidden_size % self.num_heads == 0, "hidden_size must be divisible by num_heads"
+
+        # Linear projections for Query, Key, Value - combined for efficiency
+        self.qkv_proj = nn.Linear(self.hidden_size, 3 * self.hidden_size, bias=config.bias)
+        # Output projection
+        self.out_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=config.bias)
+        # Dropout (applied after attention projection)
+        self.attn_dropout = nn.Dropout(config.attn_dropout) # Note: FlashAttention handles internal dropout
+
+        # Initialize RoPE if needed
+        if self.use_rope:
+            self.rotary_emb = RotaryPositionalEmbeddings(
+                dim=self.head_dim,
+                max_seq_len=config.max_seq_len,
+                device=config.device # Pass initial device guess
+            )
+        else:
+            self.rotary_emb = None
+
+        if self.use_flash:
+             print(f"Using FlashAttention for CausalSelfAttention.")
+        elif self.use_pytorch_sdpa:
+             print(f"Using PyTorch SDPA for CausalSelfAttention.")
+        else:
+             print("Warning: Using basic manual attention implementation. Might be slow and memory-intensive.")
+
+
+    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        Args:
+            hidden_states (torch.Tensor): Input tensor. Shape: (batch_size, seq_len, hidden_size)
+            attention_mask (torch.Tensor, optional): Not typically used with FlashAttention's causal=True,
+                                                     but potentially needed for padding with PyTorch SDPA.
+                                                     Shape: (batch_size, 1, seq_len, seq_len) or similar.
+
+        Returns:
+            torch.Tensor: Output tensor after attention. Shape: (batch_size, seq_len, hidden_size)
+        """
+        batch_size, seq_len, _ = hidden_states.size()
+
+        # 1. Project Q, K, V
+        # Shape: (batch_size, seq_len, 3 * hidden_size)
+        qkv = self.qkv_proj(hidden_states)
+
+        # 2. Split Q, K, V and reshape for multi-head attention
+        # Shape change: (bs, seq_len, 3 * hidden_size) -> 3 * (bs, seq_len, num_heads, head_dim)
+        qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+        # Shape change: (bs, seq_len, 3, num_heads, head_dim) -> 3 * (bs, num_heads, seq_len, head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4) # [3, bs, num_heads, seq_len, head_dim]
+        q, k, v = qkv[0], qkv[1], qkv[2] # Each shape: (bs, num_heads, seq_len, head_dim)
+
+        # 3. Apply Rotary Positional Embeddings (RoPE) if enabled
+        if self.rotary_emb is not None:
+             # Ensure rotary embeddings are on the same device as input
+             if self.rotary_emb.cos_cached.device != q.device:
+                  self.rotary_emb = self.rotary_emb.to(q.device)
+             # Apply RoPE to queries and keys
+             q = self.rotary_emb(q, seq_dim=2) # seq_dim is 2 after permute
+             k = self.rotary_emb(k, seq_dim=2)
+
+        # 4. Perform Causal Attention
+        # Note: FlashAttention expects (batch_size, seq_len, num_heads, head_dim)
+        q = q.permute(0, 2, 1, 3) # (bs, seq_len, num_heads, head_dim)
+        k = k.permute(0, 2, 1, 3) # (bs, seq_len, num_heads, head_dim)
+        v = v.permute(0, 2, 1, 3) # (bs, seq_len, num_heads, head_dim)
+
+        if self.use_flash:
+            # FlashAttention expects inputs in (batch_size, seq_len, num_heads, head_dim)
+            # It handles the causal mask internally with `causal=True`
+            # Dropout is also handled internally by FlashAttention
+            attn_output = flash_attn_func(
+                q, k, v,
+                dropout_p=self.config.attn_dropout if self.training else 0.0,
+                causal=True
+            )
+            # Output shape: (batch_size, seq_len, num_heads, head_dim)
+
+        elif self.use_pytorch_sdpa:
+            # PyTorch's scaled_dot_product_attention (efficient implementation >= 2.0)
+            # Expects (batch_size, num_heads, seq_len, head_dim)
+            q = q.permute(0, 2, 1, 3) # (bs, num_heads, seq_len, head_dim)
+            k = k.permute(0, 2, 1, 3) # (bs, num_heads, seq_len, head_dim)
+            v = v.permute(0, 2, 1, 3) # (bs, num_heads, seq_len, head_dim)
+
+            # `is_causal=True` handles the causal mask implicitly and efficiently
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None, # Not needed when is_causal=True for non-padded sequences
+                dropout_p=self.config.attn_dropout if self.training else 0.0,
+                is_causal=True
+            )
+            # Output shape: (batch_size, num_heads, seq_len, head_dim)
+            # Reshape back to (batch_size, seq_len, num_heads, head_dim)
+            attn_output = attn_output.permute(0, 2, 1, 3)
+
+        else:
+            # Manual Scaled Dot-Product Attention (Fallback - less efficient)
+            # Requires explicit causal mask
+            q = q.permute(0, 2, 1, 3) # (bs, num_heads, seq_len, head_dim)
+            k = k.permute(0, 2, 1, 3) # (bs, num_heads, seq_len, head_dim)
+            v = v.permute(0, 2, 1, 3) # (bs, num_heads, seq_len, head_dim)
+
+            # Calculate attention scores: (bs, num_heads, seq_len, seq_len)
+            attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+            # Apply causal mask
+            mask = torch.triu(torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool), diagonal=1)
+            attn_scores = attn_scores.masked_fill(mask, float('-inf')) # Fill upper triangle with -inf
+
+            # Apply softmax
+            attn_weights = F.softmax(attn_scores, dim=-1) # Shape: (bs, num_heads, seq_len, seq_len)
+
+            # Apply dropout to attention weights
+            attn_weights = F.dropout(attn_weights, p=self.config.attn_dropout, training=self.training)
+
+            # Multiply weights with values: (bs, num_heads, seq_len, head_dim)
+            attn_output = torch.matmul(attn_weights, v)
+
+            # Reshape back to (bs, seq_len, num_heads, head_dim)
+            attn_output = attn_output.permute(0, 2, 1, 3)
+
+
+        # 5. Combine heads and project output
+        # Reshape: (batch_size, seq_len, num_heads, head_dim) -> (batch_size, seq_len, hidden_size)
+        attn_output = attn_output.reshape(batch_size, seq_len, self.hidden_size)
+
+        # Apply output projection
+        attn_output = self.out_proj(attn_output)
+
+        # Apply final dropout (optional, sometimes skipped if dropout is in FFN)
+        # attn_output = self.attn_dropout(attn_output) # Often dropout is applied before residual connection
+
+        return attn_output
+
+
+# --- FeedForward Layer ---
+class FeedForward(nn.Module):
+    """
+    Standard FeedForward network for Transformer blocks.
+    Consists of two linear layers with an activation function in between.
+    Implements variations like SwiGLU if needed (currently standard FFN).
+    """
+    def __init__(self, config: UnifiedTransformerConfig):
+        super().__init__()
+        self.config = config
+        hidden_size = config.hidden_size
+        ffn_hidden_size = config.ffn_hidden_size
+
+        # First linear layer (upsamples)
+        self.w1 = nn.Linear(hidden_size, ffn_hidden_size, bias=config.bias)
+        # Second linear layer (downsamples)
+        self.w2 = nn.Linear(ffn_hidden_size, hidden_size, bias=config.bias)
+        # Dropout
+        self.dropout = nn.Dropout(config.ffn_dropout)
+
+        # Activation function
+        # Using SiLU (Swish) or GELU is common
+        if config.activation_function == "silu":
+            self.activation_fn = F.silu
+        elif config.activation_function == "relu":
+            self.activation_fn = F.relu
+        elif config.activation_function == "gelu":
+            # Standard GELU
+            self.activation_fn = F.gelu
+        elif config.activation_function == "gelu_new":
+            # GELU approximation used in some models like GPT-2
+            self.activation_fn = lambda x: 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
+        else:
+            raise ValueError(f"Unsupported activation function: {config.activation_function}")
+
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Project up
+        intermediate_states = self.w1(hidden_states)
+        # Apply activation
+        intermediate_states = self.activation_fn(intermediate_states)
+        # Project down
+        output_states = self.w2(intermediate_states)
+        # Apply dropout
+        output_states = self.dropout(output_states)
+        return output_states
+
+
+# --- Transformer Block ---
+class TransformerBlock(nn.Module):
+    """
+    A single Transformer block, consisting of Multi-Head Self-Attention
+    and a FeedForward network, with Layer Normalization and residual connections.
+    Uses Pre-Layer Normalization (Norm -> Attention -> Residual -> Norm -> FFN -> Residual).
+    """
+    def __init__(self, config: UnifiedTransformerConfig):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.layer_norm_eps = config.layer_norm_eps
+
+        # Layer Normalization before the attention layer
+        self.input_layernorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
+        # Causal Self-Attention layer
+        self.self_attn = CausalSelfAttention(config)
+        # Layer Normalization before the feed-forward network
+        self.post_attention_layernorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
+        # FeedForward network
+        self.mlp = FeedForward(config)
+
+    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        Forward pass through the Transformer block.
+
+        Args:
+            hidden_states (torch.Tensor): Input tensor. Shape: (batch_size, seq_len, hidden_size)
+            attention_mask (torch.Tensor, optional): Mask for attention (if needed by attention implementation).
+
+        Returns:
+            torch.Tensor: Output tensor. Shape: (batch_size, seq_len, hidden_size)
+        """
+        # Pre-Normalization & Attention
+        residual = hidden_states
+        normalized_states = self.input_layernorm(hidden_states)
+        attn_output = self.self_attn(normalized_states, attention_mask=attention_mask)
+        # Residual connection 1
+        hidden_states = residual + attn_output
+
+        # Pre-Normalization & FeedForward
+        residual = hidden_states
+        normalized_states = self.post_attention_layernorm(hidden_states)
+        feed_forward_output = self.mlp(normalized_states)
+        # Residual connection 2
+        hidden_states = residual + feed_forward_output
+
+        return hidden_states
+
+
+# --- Unified Transformer Model ---
+class UnifiedTransformer(nn.Module):
+    """
+    The main Unified Transformer model for text, image (VQ), and audio (VQ).
+    """
+    def __init__(self, config: UnifiedTransformerConfig):
+        super().__init__()
+        self.config = config
+
+        # --- 1. Embeddings ---
+        # We need separate embedding layers for each modality's vocabulary
+        self.text_embed = nn.Embedding(config.text_vocab_size, config.hidden_size)
+        self.image_embed = nn.Embedding(config.image_vocab_size, config.hidden_size)
+        self.audio_embed = nn.Embedding(config.audio_vocab_size, config.hidden_size)
+        print(f"Text Embedding: {config.text_vocab_size} tokens -> {config.hidden_size} dim")
+        print(f"Image Embedding: {config.image_vocab_size} tokens -> {config.hidden_size} dim")
+        print(f"Audio Embedding: {config.audio_vocab_size} tokens -> {config.hidden_size} dim")
+
+        # Optional: Modality Embeddings (to help distinguish token types) [cite: 26]
+        # 0: text, 1: image, 2: audio
+        self.modality_embed = nn.Embedding(3, config.hidden_size)
+        print(f"Modality Embedding: 3 types -> {config.hidden_size} dim")
+
+        self.embed_dropout = nn.Dropout(config.embed_dropout)
+
+        # --- 2. Transformer Blocks ---
+        self.layers = nn.ModuleList([
+            TransformerBlock(config) for _ in range(config.num_layers)
+        ])
+        print(f"Stacked {config.num_layers} Transformer Blocks.")
+
+        # --- 3. Final Layer Normalization (applied before output heads) ---
+        self.final_ln = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+        # --- 4. Output Heads [cite: 8] ---
+        # As per the paper description, separate heads for image and audio.
+        # Text prediction might be handled implicitly (e.g., weight tying with text_embed)
+        # or require a separate mechanism not detailed in the provided text.
+        self.image_output_head = nn.Linear(config.hidden_size, config.image_vocab_size, bias=config.bias)
+        self.audio_output_head = nn.Linear(config.hidden_size, config.audio_vocab_size, bias=config.bias)
+        print(f"Image Output Head: {config.hidden_size} -> {config.image_vocab_size} (Image VQ Codes)")
+        print(f"Audio Output Head: {config.hidden_size} -> {config.audio_vocab_size} (Audio VQ Codes)")
+
+        # Optional: Weight Tying (tie output head weights with input embeddings)
+        # Can save parameters and sometimes improve performance.
+        # self.image_output_head.weight = self.image_embed.weight
+        # self.audio_output_head.weight = self.audio_embed.weight
+        # If text output is needed, potentially:
+        # self.text_output_head = nn.Linear(config.hidden_size, config.text_vocab_size, bias=config.bias)
+        # self.text_output_head.weight = self.text_embed.weight
+
+        # Initialize weights - common practice for Transformers
+        self.apply(self._init_weights)
+        print("Model weights initialized.")
+
+        # Report number of parameters
+        print(f"Total number of parameters: {self.get_num_params()/1e9:.2f} B")
+
+
+    def get_num_params(self, non_embedding=True):
+        """
+        Return the number of parameters in the model.
+        Optionally exclude embedding layers.
+        """
+        n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            # Exclude embedding parameters used only for input mapping
+            embed_params = self.text_embed.weight.numel() + \
+                           self.image_embed.weight.numel() + \
+                           self.audio_embed.weight.numel() + \
+                           self.modality_embed.weight.numel()
+            n_params -= embed_params
+        return n_params
+
+    def _init_weights(self, module):
+        """Initialize weights using a common strategy for Transformers."""
+        if isinstance(module, nn.Linear):
+            # Initialize linear layers with normal distribution
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            # Initialize embeddings with normal distribution
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            # Optional: zero out padding index if used
+            # if module.padding_idx is not None:
+            #    with torch.no_grad():
+            #        module.weight[module.padding_idx].fill_(0)
+        elif isinstance(module, nn.LayerNorm):
+            # Initialize LayerNorm bias to 0, weight to 1
+            torch.nn.init.zeros_(module.bias)
+            torch.nn.init.ones_(module.weight)
+
+        # Special initialization for output projections (scaled based on depth)
+        # Often applied in large models for stability
+        # Example from GPT-2 / LLaMA:
+        for name, p in module.named_parameters():
+             if name == "out_proj.weight" or name == "w2.weight": # Output projection of Attention/FFN
+                  torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * self.config.num_layers))
+
+
+    def forward(self, token_ids: torch.Tensor, modality_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass of the unified model.
+
+        Args:
+            token_ids (torch.Tensor): Input tensor of token IDs.
+                                      Shape: (batch_size, seq_len).
+                                      Contains a mix of text, image VQ, and audio VQ token IDs.
+            modality_ids (torch.Tensor): Input tensor indicating the modality of each token.
+                                         Shape: (batch_size, seq_len).
+                                         Values should correspond to modality (e.g., 0=text, 1=image, 2=audio).
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+                - image_logits (torch.Tensor): Logits for image token prediction.
+                                               Shape: (batch_size, seq_len, image_vocab_size)
+                - audio_logits (torch.Tensor): Logits for audio token prediction.
+                                               Shape: (batch_size, seq_len, audio_vocab_size)
+        """
+        batch_size, seq_len = token_ids.size()
+        assert modality_ids.size() == token_ids.size(), "token_ids and modality_ids must have the same shape"
+        assert seq_len <= self.config.max_seq_len, f"Sequence length {seq_len} exceeds max_seq_len {self.config.max_seq_len}"
+        device = token_ids.device
+
+        # --- 1. Get Embeddings ---
+        # Create masks for each modality
+        text_mask = (modality_ids == 0)
+        image_mask = (modality_ids == 1)
+        audio_mask = (modality_ids == 2)
+
+        # Get embeddings from the corresponding layers
+        # Initialize embeddings tensor (important for correct device and dtype)
+        embeddings = torch.zeros(batch_size, seq_len, self.config.hidden_size, device=device, dtype=self.text_embed.weight.dtype)
+
+        # Apply embeddings based on mask
+        # Ensure indices passed to embedding layers are valid
+        if text_mask.any():
+             embeddings[text_mask] = self.text_embed(token_ids[text_mask])
+        if image_mask.any():
+             embeddings[image_mask] = self.image_embed(token_ids[image_mask])
+        if audio_mask.any():
+             embeddings[audio_mask] = self.audio_embed(token_ids[audio_mask])
+
+        # Add modality embeddings
+        mod_embeds = self.modality_embed(modality_ids)
+        hidden_states = embeddings + mod_embeds
+
+        # Apply embedding dropout
+        hidden_states = self.embed_dropout(hidden_states)
+
+        # --- 2. Pass through Transformer Blocks ---
+        # RoPE is applied internally within the CausalSelfAttention module.
+        # Causal masking is handled internally by FlashAttention or SDPA.
+        # No explicit attention_mask is passed assuming non-padded, causal sequences.
+        # If padding is used, a mask would need to be generated and passed here.
+        for layer in self.layers:
+            hidden_states = layer(hidden_states)
+
+        # --- 3. Final Layer Normalization ---
+        hidden_states = self.final_ln(hidden_states)
+
+        # --- 4. Compute Logits using Output Heads ---
+        # Calculate logits for both image and audio prediction streams [cite: 8]
+        image_logits = self.image_output_head(hidden_states)
+        audio_logits = self.audio_output_head(hidden_states)
+
+        # Logits are computed for all positions. During training, the loss function
+        # will typically only consider the logits corresponding to the target token's
+        # modality at each position (e.g., use image_logits if the target is an image token).
+        # During inference, the sampling strategy decides which logits to use based
+        # on the modality being generated.
+
+        return image_logits, audio_logits
+
+# --- Example Usage ---
+if __name__ == "__main__":
+    print("Testing Unified Transformer Implementation...")
+
+    # --- Configuration for a smaller test model ---
+    test_config = UnifiedTransformerConfig(
+        text_vocab_size=1000,
+        image_vocab_size=512,
+        audio_vocab_size=256,
+        hidden_size=128,
+        num_layers=4,
+        num_attention_heads=4,
+        ffn_hidden_size=128 * 4,
+        max_seq_len=256,
+        use_flash_attention=True, # Try with FlashAttention if available
+        use_rope=True,
+        device='cuda' if torch.cuda.is_available() else 'cpu'
+    )
+    print(f"Using device: {test_config.device}")
+    print(f"Flash Attention Available: {HAS_FLASH_ATTENTION}")
+    print(f"Using Flash Attention: {test_config.use_flash_attention and HAS_FLASH_ATTENTION}")
+    print(f"Using RoPE: {test_config.use_rope}")
+
+    # --- Instantiate the model ---
+    model = UnifiedTransformer(test_config).to(test_config.device)
+    model.eval() # Set to evaluation mode for testing
+
+    # --- Create dummy input data ---
+    batch_size = 2
+    seq_len = 100
+    # Generate random token IDs within valid ranges
+    text_tokens = torch.randint(0, test_config.text_vocab_size, (batch_size, seq_len // 3), device=test_config.device)
+    image_tokens = torch.randint(0, test_config.image_vocab_size, (batch_size, seq_len // 3), device=test_config.device)
+    audio_tokens = torch.randint(0, test_config.audio_vocab_size, (batch_size, seq_len - 2 * (seq_len // 3)), device=test_config.device)
+
+    # Combine tokens and create modality IDs
+    token_ids = torch.cat([text_tokens, image_tokens, audio_tokens], dim=1)
+    modality_ids = torch.cat([
+        torch.zeros_like(text_tokens),  # 0 for text
+        torch.ones_like(image_tokens),   # 1 for image
+        torch.full_like(audio_tokens, 2) # 2 for audio
+    ], dim=1).to(test_config.device)
+
+    # Shuffle the sequence for a more realistic interleaved test (optional)
+    # perm = torch.randperm(token_ids.size(1))
+    # token_ids = token_ids[:, perm]
+    # modality_ids = modality_ids[:, perm]
+
+    print(f"\nInput token_ids shape: {token_ids.shape}")      # Should be (batch_size, seq_len)
+    print(f"Input modality_ids shape: {modality_ids.shape}")  # Should be (batch_size, seq_len)
+
+    # --- Perform a forward pass ---
+    with torch.no_grad(): # Disable gradient calculation for inference
+        # Use autocast for mixed precision if desired (especially relevant with FlashAttention)
+        if test_config.device == 'cuda' and HAS_FLASH_ATTENTION:
+             print("\nUsing autocast for mixed precision (bfloat16)")
+             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                  image_logits, audio_logits = model(token_ids, modality_ids)
+        else:
+             print("\nRunning forward pass (CPU or no FlashAttention - using float32)")
+             image_logits, audio_logits = model(token_ids, modality_ids)
+
+
+    # --- Print output shapes ---
+    print(f"\nOutput image_logits shape: {image_logits.shape}") # Should be (batch_size, seq_len, image_vocab_size)
+    print(f"Output audio_logits shape: {audio_logits.shape}") # Should be (batch_size, seq_len, audio_vocab_size)
+
+    # --- Check parameter count (for the small test model) ---
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\nTest model parameter count:")
+    print(f"  Total params: {total_params:,}")
+    print(f"  Trainable params: {trainable_params:,}")
+
+    print("\nImplementation structure complete.")
