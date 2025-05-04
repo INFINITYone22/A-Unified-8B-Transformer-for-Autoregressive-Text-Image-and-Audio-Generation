@@ -101,22 +101,4 @@ Unauthorized copying, modification, distribution, or use of this code, or any pa
 
 ---
 
-## License Explanation for You
 
-To retain complete ownership and control over your code and prevent others from using, modifying, or distributing it without your permission, the best approach on GitHub is **not to include a standard open-source license file** (like MIT, Apache 2.0, or GPL).
-
-Here's why and what it means:
-
-1.  **Default Copyright:** When you create original work (like code), you automatically hold the copyright under international law (e.g., the Berne Convention). This copyright grants you exclusive rights to reproduce, distribute, modify, and perform the work.
-2.  **No License = All Rights Reserved:** By *not* providing an open-source license, you are not granting any of those exclusive rights to others. The code is effectively proprietary.
-3.  **GitHub's Terms of Service:** GitHub's ToS allow users to view and fork public repositories *on the GitHub platform*. This is a limited right necessary for GitHub's function; it does **not** grant permission to use, modify, or distribute the code outside of that specific GitHub context (e.g., in another project, commercially, etc.).
-4.  **README Statement:** The "License" section I included in the README above clearly states "All Rights Reserved" and explicitly prohibits unauthorized actions. This reinforces your intention and clarifies the terms for anyone viewing the repository.
-
-**Implications:**
-
-* **Maximum Control:** You retain full legal control over the code.
-* **Limited Collaboration:** Others cannot legally contribute back (unless you make a separate agreement) or build upon your work.
-* **Limited Use:** Others cannot legally use your code in their projects (open source or commercial).
-* **Recruiter Perception:** While it shows you can write complex code, recruiters specifically looking for open-source contributions or experience with collaborative development might see this differently than a project with a standard OS license. However, the detailed technical description in the README should still be impressive.
-
-This "All Rights Reserved" approach directly addresses your requirement to retain complete ownership. Just be aware of the trade-offs regarding collaboration and open-source participation.
